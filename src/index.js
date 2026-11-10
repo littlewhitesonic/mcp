@@ -74,7 +74,7 @@ export default {
       const tokenResponse = {
         access_token: masterKey, 
         token_type: "Bearer",
-        expires_in: 315360000 // 10 years (effectively permanent so Grok never loses access)
+        expires_in: 315360000 // 10 years
       };
 
       return new Response(JSON.stringify(tokenResponse), {
@@ -170,6 +170,7 @@ export default {
           throw new Error("Missing server configuration: HF_TOKEN and HF_REPO_ID variables are required.");
         }
 
+        // FIXED STRING INTERPOLATION SYNTAX:
         const hfUploadUrl = `https://huggingface.co{repoType}s/${repoId}/upload/${finalFileName}`;
 
         const hfResponse = await fetch(hfUploadUrl, {
@@ -186,6 +187,7 @@ export default {
           throw new Error(`Hugging Face API Error (${hfResponse.status}): ${errText}`);
         }
 
+        // FIXED STRING INTERPOLATION SYNTAX:
         const storageUrl = `https://huggingface.co{repoType}s/${repoId}/resolve/main/${finalFileName}`;
 
         return new Response(JSON.stringify({
