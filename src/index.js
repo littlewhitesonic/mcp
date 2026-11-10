@@ -1,207 +1,192 @@
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version, x-mcp-protocol-version",
+  "Access-Control-Expose-Headers": "Mcp-Session-Id",
+};
+
+const json = (obj, status = 200, extra = {}) =>
+  new Response(JSON.stringify(obj), {
+    status,
+    headers: { "Content-Type": "application/json", ...CORS, ...extra },
+  });
+
+const TOOLS = [
+  {
+    name: "upload_image",
+    description:
+      "Downloads an image from a URL and saves it to a Hugging Face repository (dataset/model).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        imageUrl: { type: "string", description: "Public HTTP/HTTPS URL of the image." },
+        fileName: { type: "string", description: "Optional file name, e.g. image.jpg." },
+      },
+      required: ["imageUrl"],
+    },
+  },
+];
+
+function toBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+async function uploadImage(args, env) {
+  const { imageUrl, fileName } = args || {};
+  if (!imageUrl) throw new Error("Missing required argument: imageUrl");
+
+  const img = await fetch(imageUrl);
+  if (!img.ok) throw new Error(`Failed to download image (status ${img.status})`);
+
+  const buf = await img.arrayBuffer();
+  const ct = img.headers.get("content-type") || "image/png";
+  let ext = "png";
+  if (/jpe?g/.test(ct)) ext = "jpg";
+  else if (ct.includes("webp")) ext = "webp";
+  else if (ct.includes("gif")) ext = "gif";
+
+  const name = fileName || `grok_${Date.now()}.${ext}`;
+
+  const { HF_TOKEN, HF_REPO_ID } = env;
+  const repoType = env.HF_REPO_TYPE || "dataset"; // dataset | model | space
+  if (!HF_TOKEN || !HF_REPO_ID) throw new Error("Server missing HF_TOKEN / HF_REPO_ID");
+
+  // HF commit API (NDJSON, base64 file content)
+  const lines = [
+    JSON.stringify({ key: "header", value: { summary: `Upload ${name}` } }),
+    JSON.stringify({ key: "file", value: { content: toBase64(buf), path: name, encoding: "base64" } }),
+  ].join("\n");
+
+  const commitUrl = `https://huggingface.co/api/${repoType}s/${HF_REPO_ID}/commit/main`;
+  const res = await fetch(commitUrl, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${HF_TOKEN}`, "Content-Type": "application/x-ndjson" },
+    body: lines,
+  });
+  if (!res.ok) throw new Error(`Hugging Face API error (${res.status}): ${await res.text()}`);
+
+  const prefix = repoType === "model" ? "" : `${repoType}s/`;
+  const link = `https://huggingface.co/${prefix}${HF_REPO_ID}/resolve/main/${name}`;
+  return `Saved to Hugging Face.\nFile: ${name}\nLink: ${link}`;
+}
+
+async function handleRpc(msg, env, request) {
+  const { id, method, params } = msg;
+  const ok = (result) => ({ jsonrpc: "2.0", id, result });
+  const err = (code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
+
+  switch (method) {
+    case "initialize":
+      return ok({
+        protocolVersion: params?.protocolVersion || "2025-03-26",
+        capabilities: { tools: {} },
+        serverInfo: { name: "hf-image-uploader", version: "1.0.0" },
+      });
+    case "ping":
+      return ok({});
+    case "tools/list":
+      return ok({ tools: TOOLS });
+    case "tools/call": {
+      const auth = request.headers.get("Authorization");
+      if (!env.GROK_API_KEY || auth !== `Bearer ${env.GROK_API_KEY}`) {
+        return err(-32001, "Unauthorized");
+      }
+      if (params?.name !== "upload_image") return err(-32602, "Unknown tool");
+      try {
+        const text = await uploadImage(params.arguments, env);
+        return ok({ content: [{ type: "text", text }] });
+      } catch (e) {
+        return ok({ content: [{ type: "text", text: `Storage error: ${e.message}` }], isError: true });
+      }
+    }
+    default:
+      return err(-32601, `Method not found: ${method}`);
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // --- 1. CORS 跨域与基础首部处理 ---
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-mcp-protocol-version",
-    };
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
+    // ---------- OAuth discovery + (mock) flow ----------
+    if (url.pathname.startsWith("/.well-known/oauth-protected-resource")) {
+      return json({ resource: url.origin, authorization_servers: [url.origin] });
     }
-
-    // ==========================================
-    // --- 2. 模拟 OAUTH 流程端点 ---
-    // ==========================================
+    if (url.pathname.startsWith("/.well-known/oauth-authorization-server")) {
+      return json({
+        issuer: url.origin,
+        authorization_endpoint: `${url.origin}/oauth/authorize`,
+        token_endpoint: `${url.origin}/oauth/token`,
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code"],
+        token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
+        code_challenge_methods_supported: ["S256", "plain"],
+      });
+    }
     if (url.pathname === "/oauth/authorize") {
       const redirectUri = url.searchParams.get("redirect_uri");
       const state = url.searchParams.get("state");
-
-      if (!redirectUri) {
-        return new Response("Missing redirect_uri parameter", { status: 400 });
-      }
-
-      const callbackUrl = new URL(redirectUri);
-      callbackUrl.searchParams.set("code", "temp_secure_auth_code_123");
-      if (state) callbackUrl.searchParams.set("state", state);
-
-      return new Response(null, {
-        status: 302,
-        headers: { "Location": callbackUrl.toString() }
-      });
+      if (!redirectUri) return new Response("Missing redirect_uri", { status: 400 });
+      const cb = new URL(redirectUri);
+      cb.searchParams.set("code", "temp_secure_auth_code_123");
+      if (state) cb.searchParams.set("state", state);
+      return new Response(null, { status: 302, headers: { Location: cb.toString() } });
     }
-
     if (url.pathname === "/oauth/token") {
-      let clientSecret = "";
-      
+      let secret = "";
+      const ct = request.headers.get("content-type") || "";
       if (request.method === "POST") {
-        const contentType = request.headers.get("content-type") || "";
-        if (contentType.includes("application/x-www-form-urlencoded")) {
-          const formData = await request.formData();
-          clientSecret = formData.get("client_secret") || "";
-        } else if (contentType.includes("application/json")) {
-          const body = await request.json();
-          clientSecret = body.client_secret || "";
+        if (ct.includes("application/x-www-form-urlencoded")) {
+          secret = (await request.formData()).get("client_secret") || "";
+        } else if (ct.includes("application/json")) {
+          secret = (await request.json()).client_secret || "";
         }
       }
-
-      const authHeader = request.headers.get("Authorization");
-      if (!clientSecret && authHeader && authHeader.startsWith("Basic ")) {
-        try {
-          const credentials = atob(authHeader.split(" ")[1]);
-          clientSecret = credentials.split(":")[1];
-        } catch (e) {}
+      const basic = request.headers.get("Authorization");
+      if (!secret && basic?.startsWith("Basic ")) {
+        try { secret = atob(basic.split(" ")[1]).split(":")[1] || ""; } catch (_) {}
       }
-
-      const masterKey = env.GROK_API_KEY; 
-      if (!masterKey || clientSecret !== masterKey) {
-        return new Response(JSON.stringify({ error: "Invalid client_secret provided." }), {
-          status: 401,
-          headers: { "Content-Type": "application/json", ...corsHeaders }
-        });
+      if (!env.GROK_API_KEY || secret !== env.GROK_API_KEY) {
+        return json({ error: "invalid_client" }, 401);
       }
-
-      return new Response(JSON.stringify({
-        access_token: masterKey, 
-        token_type: "Bearer",
-        expires_in: 315360000
-      }), {
-        headers: { "Content-Type": "application/json", ...corsHeaders }
-      });
+      return json({ access_token: env.GROK_API_KEY, token_type: "Bearer", expires_in: 315360000 });
     }
 
-    // ==========================================
-    // --- 3. MCP 核心业务端点（自适应 Grok 根目录探测） ---
-    // ==========================================
+    // ---------- MCP (Streamable HTTP, JSON-RPC 2.0) at / or /mcp ----------
+    if (url.pathname === "/" || url.pathname === "/mcp") {
+      if (request.method === "GET") {
+        // No server-initiated SSE stream
+        return new Response("Method Not Allowed", { status: 405, headers: CORS });
+      }
+      if (request.method === "POST") {
+        let body;
+        try { body = await request.json(); }
+        catch { return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400); }
 
-    const isListToolsRoute = (request.method === "POST" && (url.pathname === "/tools/list" || url.pathname === "/"));
-    
-    // --- MCP A: 工具发现（只要请求主页或者 /tools/list 均返回此列表） ---
-    if (isListToolsRoute) {
-      const responseBody = {
-        tools: [
-          {
-            name: "upload_image",
-            description: "Downloads an image from a URL and saves it directly to a Hugging Face Bucket or Dataset repository.",
-            inputSchema: {
-              type: "object",
-              properties: {
-                imageUrl: {
-                  type: "string",
-                  description: "The public HTTP/HTTPS URL of the image to fetch and upload."
-                },
-                fileName: {
-                  type: "string",
-                  description: "Optional custom name for the file (e.g. image.jpg). If omitted, a timestamp name is generated."
-                }
-              },
-              required: ["imageUrl"]
-            }
+        if (Array.isArray(body)) {
+          const out = [];
+          for (const m of body) {
+            if (m.id === undefined) continue; // notification
+            out.push(await handleRpc(m, env, request));
           }
-        ]
-      };
-
-      return new Response(JSON.stringify(responseBody), {
-        headers: { "Content-Type": "application/json", ...corsHeaders }
-      });
-    }
-
-    // --- MCP B: 工具真正的执行调用 ---
-    if (request.method === "POST" && url.pathname === "/tools/call") {
-      const authHeader = request.headers.get("Authorization");
-      const expectedAuth = env.GROK_API_KEY ? `Bearer ${env.GROK_API_KEY}` : null;
-
-      if (!expectedAuth || authHeader !== expectedAuth) {
-        return new Response(JSON.stringify({ error: "Unauthorized custom MCP request." }), {
-          status: 401,
-          headers: { "Content-Type": "application/json", ...corsHeaders }
-        });
-      }
-
-      try {
-        const body = await request.json();
-        
-        if (body.name !== "upload_image") {
-          return new Response(JSON.stringify({ error: "Unknown tool requested" }), { 
-            status: 400,
-            headers: corsHeaders
-          });
+          return out.length ? json(out) : new Response(null, { status: 202, headers: CORS });
         }
-
-        const { imageUrl, fileName } = body.arguments || {};
-        if (!imageUrl) {
-          throw new Error("Missing required argument: imageUrl");
+        if (body.id === undefined) {
+          // notification, e.g. notifications/initialized
+          return new Response(null, { status: 202, headers: CORS });
         }
-
-        const imageResponse = await fetch(imageUrl);
-        if (!imageResponse.ok) {
-          throw new Error(`Failed to download image from source URL (Status ${imageResponse.status})`);
-        }
-
-        const blob = await imageResponse.blob();
-        const contentType = imageResponse.headers.get("content-type") || "image/png";
-        
-        let extension = "png";
-        if (contentType.includes("jpeg") || contentType.includes("jpg")) extension = "jpg";
-        if (contentType.includes("webp")) extension = "webp";
-
-        const finalFileName = fileName || `grok_${Date.now()}.${extension}`;
-
-        const hfToken = env.HF_TOKEN; 
-        const repoId = env.HF_REPO_ID; 
-        const repoType = env.HF_REPO_TYPE || "dataset"; 
-
-        if (!hfToken || !repoId) {
-          throw new Error("Missing server configuration: HF_TOKEN and HF_REPO_ID variables are required.");
-        }
-
-        // 修正了模板字符串语法错误：使用 ${repoType} 而不是 {repoType}
-        const hfUploadUrl = `https://huggingface.co{repoType}s/${repoId}/upload/${finalFileName}`;
-
-        const hfResponse = await fetch(hfUploadUrl, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${hfToken}`,
-            "Content-Type": contentType
-          },
-          body: blob
-        });
-
-        if (!hfResponse.ok) {
-          const errText = await hfResponse.text();
-          throw new Error(`Hugging Face API Error (${hfResponse.status}): ${errText}`);
-        }
-
-        const storageUrl = `https://huggingface.co{repoType}s/${repoId}/resolve/main/${finalFileName}`;
-
-        return new Response(JSON.stringify({
-          content: [
-            {
-              type: "text",
-              text: `🎯 Photo successfully saved to Hugging Face!\n📁 Filename: ${finalFileName}\n🔗 View/Download Link: ${storageUrl}`
-            }
-          ]
-        }), { 
-          headers: { "Content-Type": "application/json", ...corsHeaders } 
-        });
-
-      } catch (error) {
-        return new Response(JSON.stringify({
-          content: [{ type: "text", text: `❌ Storage Error: ${error.message}` }],
-          isError: true
-        }), { 
-          headers: { "Content-Type": "application/json", ...corsHeaders } 
-        });
+        return json(await handleRpc(body, env, request));
       }
     }
 
-    // GET / 兜底响应
-    return new Response("Hugging Face MCP Server is running and fully compatible with Grok root discovery.", { 
-      status: 200, 
-      headers: corsHeaders 
-    });
-  }
+    return new Response("Not found", { status: 404, headers: CORS });
+  },
 };
