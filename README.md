@@ -1,1 +1,3 @@
 # mcp
+
+HF_TOKEN
