@@ -1,0 +1,13 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "mcp"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[vars]
+# Do NOT put your real secret API tokens directly in this file if you plan to share it.
+# Instead, add these variables in your Cloudflare Dashboard under Settings -> Variables.
+# HF_REPO_ID = "your-username/your-repository-name"
+# HF_REPO_TYPE = "dataset" # "dataset" or "bucket"
+
+# Note: GROK_API_KEY and HF_TOKEN should be set as "Secrets" 
+# inside your Cloudflare Workers Dashboard for optimal security.
