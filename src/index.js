@@ -2,7 +2,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // --- 1. CORS Preflight Handling ---
+    // --- 1. CORS 跨域处理 ---
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -14,10 +14,10 @@ export default {
     }
 
     // ==========================================
-    // --- SECURE MOCK OAUTH ENDPOINTS ---
+    // --- 2. 模拟 OAUTH 端点 ---
     // ==========================================
 
-    // Grok Step A: Authorization Request
+    // Grok A 阶段: 授权重定向
     if (url.pathname === "/oauth/authorize") {
       const redirectUri = url.searchParams.get("redirect_uri");
       const state = url.searchParams.get("state");
@@ -27,7 +27,6 @@ export default {
       }
 
       const callbackUrl = new URL(redirectUri);
-      // Pass a temporary authorization code
       callbackUrl.searchParams.set("code", "temp_secure_auth_code_123");
       if (state) callbackUrl.searchParams.set("state", state);
 
@@ -37,11 +36,10 @@ export default {
       });
     }
 
-    // Grok Step B: Token Exchange
+    // Grok B 阶段: 换取 Access Token
     if (url.pathname === "/oauth/token") {
       let clientSecret = "";
       
-      // Extract client_secret from either POST body or Basic Auth
       if (request.method === "POST") {
         const contentType = request.headers.get("content-type") || "";
         if (contentType.includes("application/x-www-form-urlencoded")) {
@@ -61,7 +59,7 @@ export default {
         } catch (e) {}
       }
 
-      // CRITICAL SECURITY CHECK: Verify the secret matches your master key
+      // 验证 Grok 后台输入的 Client Secret 是否匹配你的 GROK_API_KEY
       const masterKey = env.GROK_API_KEY; 
       if (!masterKey || clientSecret !== masterKey) {
         return new Response(JSON.stringify({ error: "Invalid client_secret provided." }), {
@@ -70,11 +68,11 @@ export default {
         });
       }
 
-      // Issue an access token that mirrors your secret key
+      // 返回长期有效的安全 Token (直接复用你的 GROK_API_KEY 作为 token)
       const tokenResponse = {
         access_token: masterKey, 
         token_type: "Bearer",
-        expires_in: 315360000 // 10 years
+        expires_in: 315360000
       };
 
       return new Response(JSON.stringify(tokenResponse), {
@@ -83,25 +81,10 @@ export default {
     }
 
     // ==========================================
-    // --- LIVE HEADER VALIDATION FOR TOOLS ---
-    // ==========================================
-    if (url.pathname.startsWith("/tools")) {
-      const authHeader = request.headers.get("Authorization");
-      const expectedAuth = env.GROK_API_KEY ? `Bearer ${env.GROK_API_KEY}` : null;
-
-      if (!expectedAuth || authHeader !== expectedAuth) {
-        return new Response(JSON.stringify({ error: "Unauthorized custom MCP request." }), {
-          status: 401,
-          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-        });
-      }
-    }
-
-    // ==========================================
-    // --- MCP SPECIFIC ENDPOINTS ---
+    // --- 3. MCP 核心端点 ---
     // ==========================================
 
-    // --- MCP Handshake / List Tools ---
+    // --- MCP A: 工具列表 (允许匿名公开访问，让 Grok 顺利发现服务器) ---
     if (request.method === "POST" && url.pathname === "/tools/list") {
       const responseBody = {
         tools: [
@@ -131,8 +114,19 @@ export default {
       });
     }
 
-    // --- MCP Tool Execution (The Upload Trigger) ---
+    // --- MCP B: 真正的工具执行 (严加死守，必须验证 Token) ---
     if (request.method === "POST" && url.pathname === "/tools/call") {
+      // 拦截无 Token 或 Token 错误的请求
+      const authHeader = request.headers.get("Authorization");
+      const expectedAuth = env.GROK_API_KEY ? `Bearer ${env.GROK_API_KEY}` : null;
+
+      if (!expectedAuth || authHeader !== expectedAuth) {
+        return new Response(JSON.stringify({ error: "Unauthorized custom MCP request." }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+
       try {
         const body = await request.json();
         
@@ -148,6 +142,7 @@ export default {
           throw new Error("Missing required argument: imageUrl");
         }
 
+        // 从 Grok 的生成链接中下载图片
         const imageResponse = await fetch(imageUrl);
         if (!imageResponse.ok) {
           throw new Error(`Failed to download image from source URL (Status ${imageResponse.status})`);
@@ -170,9 +165,9 @@ export default {
           throw new Error("Missing server configuration: HF_TOKEN and HF_REPO_ID variables are required.");
         }
 
-        // FIXED STRING INTERPOLATION SYNTAX:
         const hfUploadUrl = `https://huggingface.co{repoType}s/${repoId}/upload/${finalFileName}`;
 
+        // 上传 Payload 到 Hugging Face 存储库
         const hfResponse = await fetch(hfUploadUrl, {
           method: "POST",
           headers: {
@@ -187,7 +182,6 @@ export default {
           throw new Error(`Hugging Face API Error (${hfResponse.status}): ${errText}`);
         }
 
-        // FIXED STRING INTERPOLATION SYNTAX:
         const storageUrl = `https://huggingface.co{repoType}s/${repoId}/resolve/main/${finalFileName}`;
 
         return new Response(JSON.stringify({
@@ -211,6 +205,6 @@ export default {
       }
     }
 
-    return new Response("Secure Hugging Face MCP Server running.", { status: 200 });
+    return new Response("Secure Hugging Face MCP Server running. Ready for Grok handshake.", { status: 200 });
   }
 };
