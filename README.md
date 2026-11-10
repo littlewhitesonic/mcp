@@ -1,3 +1,5 @@
 # mcp
 
 HF_TOKEN
+GROK_API_KEY
+
