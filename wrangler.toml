@@ -11,3 +11,10 @@ compatibility_date = "2024-11-01"
 
 # Note: GROK_API_KEY and HF_TOKEN should be set as "Secrets" 
 # inside your Cloudflare Workers Dashboard for optimal security.
+
+# ...
+[observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
+# ...
