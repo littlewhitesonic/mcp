@@ -57,17 +57,68 @@ async function uploadImage(args, env) {
   const repoType = env.HF_REPO_TYPE || "dataset"; // dataset | model | space
   if (!HF_TOKEN || !HF_REPO_ID) throw new Error("Server missing HF_TOKEN / HF_REPO_ID");
 
-  // HF commit API (NDJSON, base64 file content)
-  const lines = [
-    JSON.stringify({ key: "header", value: { summary: `Upload ${name}` } }),
-    JSON.stringify({ key: "file", value: { content: toBase64(buf), path: name, encoding: "base64" } }),
-  ].join("\n");
+  const bytes = new Uint8Array(buf);
+  const authH = { Authorization: `Bearer ${HF_TOKEN}` };
+  const repoApi = `https://huggingface.co/api/${repoType}s/${HF_REPO_ID}`;
+  const repoGit = `https://huggingface.co/${repoType === "model" ? "" : repoType + "s/"}${HF_REPO_ID}.git`;
+
+  // 1) Ask the Hub whether this file must go through LFS/Xet (binary) or can be inline
+  const pre = await fetch(`${repoApi}/preupload/main`, {
+    method: "POST",
+    headers: { ...authH, "Content-Type": "application/json" },
+    body: JSON.stringify({ files: [{ path: name, size: bytes.length, sample: toBase64(bytes.slice(0, 512)) }] }),
+  });
+  if (!pre.ok) throw new Error(`Hugging Face preupload error (${pre.status}): ${await pre.text()}`);
+  const mode = (await pre.json()).files?.[0]?.uploadMode || "lfs";
+
+  const lines = [JSON.stringify({ key: "header", value: { summary: `Upload ${name}` } })];
+
+  if (mode === "regular") {
+    lines.push(JSON.stringify({ key: "file", value: { content: toBase64(buf), path: name, encoding: "base64" } }));
+  } else {
+    // 2) LFS upload (the Hub bridges LFS to Xet storage)
+    const oid = [...new Uint8Array(await crypto.subtle.digest("SHA-256", buf))]
+      .map((b) => b.toString(16).padStart(2, "0")).join("");
+    const lfsHeaders = { ...authH, Accept: "application/vnd.git-lfs+json", "Content-Type": "application/vnd.git-lfs+json" };
+
+    const batch = await fetch(`${repoGit}/info/lfs/objects/batch`, {
+      method: "POST",
+      headers: lfsHeaders,
+      body: JSON.stringify({
+        operation: "upload",
+        transfers: ["basic"],
+        objects: [{ oid, size: bytes.length }],
+        hash_algo: "sha256",
+        ref: { name: "main" },
+      }),
+    });
+    if (!batch.ok) throw new Error(`LFS batch error (${batch.status}): ${await batch.text()}`);
+    const obj = (await batch.json()).objects?.[0];
+    if (obj?.error) throw new Error(`LFS error: ${obj.error.message}`);
+
+    const up = obj?.actions?.upload; // absent => object already stored
+    if (up) {
+      const put = await fetch(up.href, { method: "PUT", headers: up.header || {}, body: buf });
+      if (!put.ok) throw new Error(`LFS upload error (${put.status}): ${await put.text()}`);
+      const ver = obj.actions.verify;
+      if (ver) {
+        const v = await fetch(ver.href, {
+          method: "POST",
+          headers: { ...(ver.header || {}), ...lfsHeaders },
+          body: JSON.stringify({ oid, size: bytes.length }),
+        });
+        if (!v.ok) throw new Error(`LFS verify error (${v.status}): ${await v.text()}`);
+      }
+    }
+    lines.push(JSON.stringify({ key: "lfsFile", value: { path: name, algo: "sha256", size: bytes.length, oid } }));
+  }
+  const ndjson = lines.join("\n");
 
   const commitUrl = `https://huggingface.co/api/${repoType}s/${HF_REPO_ID}/commit/main`;
   const res = await fetch(commitUrl, {
     method: "POST",
     headers: { Authorization: `Bearer ${HF_TOKEN}`, "Content-Type": "application/x-ndjson" },
-    body: lines,
+    body: ndjson,
   });
   if (!res.ok) throw new Error(`Hugging Face API error (${res.status}): ${await res.text()}`);
 
