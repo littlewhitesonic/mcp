@@ -76,7 +76,7 @@ async function uploadImage(args, env) {
   return `Saved to Hugging Face.\nFile: ${name}\nLink: ${link}`;
 }
 
-async function handleRpc(msg, env, request) {
+async function handleRpc(msg, env, request, url) {
   const { id, method, params } = msg;
   const ok = (result) => ({ jsonrpc: "2.0", id, result });
   const err = (code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
@@ -94,7 +94,10 @@ async function handleRpc(msg, env, request) {
       return ok({ tools: TOOLS });
     case "tools/call": {
       const auth = request.headers.get("Authorization");
-      if (!env.GROK_API_KEY || auth !== `Bearer ${env.GROK_API_KEY}`) {
+      const keyOk =
+        env.GROK_API_KEY &&
+        (auth === `Bearer ${env.GROK_API_KEY}` || url.searchParams.get("key") === env.GROK_API_KEY);
+      if (!keyOk) {
         return err(-32001, "Unauthorized");
       }
       if (params?.name !== "upload_image") return err(-32602, "Unknown tool");
@@ -117,20 +120,7 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
 
     // ---------- OAuth discovery + (mock) flow ----------
-    if (url.pathname.startsWith("/.well-known/oauth-protected-resource")) {
-      return json({ resource: url.origin, authorization_servers: [url.origin] });
-    }
-    if (url.pathname.startsWith("/.well-known/oauth-authorization-server")) {
-      return json({
-        issuer: url.origin,
-        authorization_endpoint: `${url.origin}/oauth/authorize`,
-        token_endpoint: `${url.origin}/oauth/token`,
-        response_types_supported: ["code"],
-        grant_types_supported: ["authorization_code"],
-        token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
-        code_challenge_methods_supported: ["S256", "plain"],
-      });
-    }
+    // (OAuth discovery removed: auth is now via ?key=<GROK_API_KEY> in the URL or a Bearer header)
     if (url.pathname === "/oauth/authorize") {
       const redirectUri = url.searchParams.get("redirect_uri");
       const state = url.searchParams.get("state");
@@ -175,7 +165,7 @@ export default {
           const out = [];
           for (const m of body) {
             if (m.id === undefined) continue; // notification
-            out.push(await handleRpc(m, env, request));
+            out.push(await handleRpc(m, env, request, url));
           }
           return out.length ? json(out) : new Response(null, { status: 202, headers: CORS });
         }
@@ -183,7 +173,7 @@ export default {
           // notification, e.g. notifications/initialized
           return new Response(null, { status: 202, headers: CORS });
         }
-        return json(await handleRpc(body, env, request));
+        return json(await handleRpc(body, env, request, url));
       }
     }
 
