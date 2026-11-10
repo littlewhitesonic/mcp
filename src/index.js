@@ -1,6 +1,8 @@
 export default {
   async fetch(request, env) {
-    // Handle CORS preflight requests from Grok.com
+    const url = new URL(request.url);
+
+    // --- 1. CORS Preflight Handling ---
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -11,25 +13,95 @@ export default {
       });
     }
 
-    // --- SECURITY ACCESS CHECK ---
-    // Enforce authorization so strangers cannot exploit your worker.
-    const authHeader = request.headers.get("Authorization");
-    const expectedAuth = env.GROK_API_KEY ? `Bearer ${env.GROK_API_KEY}` : null;
+    // ==========================================
+    // --- SECURE MOCK OAUTH ENDPOINTS ---
+    // ==========================================
 
-    // Only enforce if you have set the GROK_API_KEY variable in your Cloudflare dashboard
-    if (expectedAuth && authHeader !== expectedAuth) {
-      return new Response(JSON.stringify({ error: "Unauthorized access attempt." }), {
-        status: 401,
-        headers: { 
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*" 
-        }
+    // Grok Step A: Authorization Request
+    if (url.pathname === "/oauth/authorize") {
+      const redirectUri = url.searchParams.get("redirect_uri");
+      const state = url.searchParams.get("state");
+
+      if (!redirectUri) {
+        return new Response("Missing redirect_uri parameter", { status: 400 });
+      }
+
+      const callbackUrl = new URL(redirectUri);
+      // Pass a temporary authorization code
+      callbackUrl.searchParams.set("code", "temp_secure_auth_code_123");
+      if (state) callbackUrl.searchParams.set("state", state);
+
+      return new Response(null, {
+        status: 302,
+        headers: { "Location": callbackUrl.toString() }
       });
     }
 
-    const url = new URL(request.url);
+    // Grok Step B: Token Exchange
+    if (url.pathname === "/oauth/token") {
+      let clientSecret = "";
+      
+      // Extract client_secret from either POST body or Basic Auth
+      if (request.method === "POST") {
+        const contentType = request.headers.get("content-type") || "";
+        if (contentType.includes("application/x-www-form-urlencoded")) {
+          const formData = await request.formData();
+          clientSecret = formData.get("client_secret") || "";
+        } else if (contentType.includes("application/json")) {
+          const body = await request.json();
+          clientSecret = body.client_secret || "";
+        }
+      }
 
-    // --- 1. MCP Handshake / List Tools ---
+      const authHeader = request.headers.get("Authorization");
+      if (!clientSecret && authHeader && authHeader.startsWith("Basic ")) {
+        try {
+          const credentials = atob(authHeader.split(" ")[1]);
+          clientSecret = credentials.split(":")[1];
+        } catch (e) {}
+      }
+
+      // CRITICAL SECURITY CHECK: Verify the secret matches your master key
+      const masterKey = env.GROK_API_KEY; 
+      if (!masterKey || clientSecret !== masterKey) {
+        return new Response(JSON.stringify({ error: "Invalid client_secret provided." }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+
+      // Issue an access token that mirrors your secret key
+      const tokenResponse = {
+        access_token: masterKey, 
+        token_type: "Bearer",
+        expires_in: 315360000 // 10 years (effectively permanent so Grok never loses access)
+      };
+
+      return new Response(JSON.stringify(tokenResponse), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    // ==========================================
+    // --- LIVE HEADER VALIDATION FOR TOOLS ---
+    // ==========================================
+    if (url.pathname.startsWith("/tools")) {
+      const authHeader = request.headers.get("Authorization");
+      const expectedAuth = env.GROK_API_KEY ? `Bearer ${env.GROK_API_KEY}` : null;
+
+      if (!expectedAuth || authHeader !== expectedAuth) {
+        return new Response(JSON.stringify({ error: "Unauthorized custom MCP request." }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+    }
+
+    // ==========================================
+    // --- MCP SPECIFIC ENDPOINTS ---
+    // ==========================================
+
+    // --- MCP Handshake / List Tools ---
     if (request.method === "POST" && url.pathname === "/tools/list") {
       const responseBody = {
         tools: [
@@ -55,14 +127,11 @@ export default {
       };
 
       return new Response(JSON.stringify(responseBody), {
-        headers: { 
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*" 
-        }
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
 
-    // --- 2. MCP Tool Execution (The Upload Trigger) ---
+    // --- MCP Tool Execution (The Upload Trigger) ---
     if (request.method === "POST" && url.pathname === "/tools/call") {
       try {
         const body = await request.json();
@@ -79,7 +148,6 @@ export default {
           throw new Error("Missing required argument: imageUrl");
         }
 
-        // Fetch image from Grok's generated image link
         const imageResponse = await fetch(imageUrl);
         if (!imageResponse.ok) {
           throw new Error(`Failed to download image from source URL (Status ${imageResponse.status})`);
@@ -88,26 +156,22 @@ export default {
         const blob = await imageResponse.blob();
         const contentType = imageResponse.headers.get("content-type") || "image/png";
         
-        // Infer file extension or fallback
         let extension = "png";
         if (contentType.includes("jpeg") || contentType.includes("jpg")) extension = "jpg";
         if (contentType.includes("webp")) extension = "webp";
 
-        // Generate unique filename
         const finalFileName = fileName || `grok_${Date.now()}.${extension}`;
 
-        // Get Environment Variables configured in the Cloudflare Dashboard
         const hfToken = env.HF_TOKEN; 
-        const repoId = env.HF_REPO_ID; // format: "username/bucket-name"
-        const repoType = env.HF_REPO_TYPE || "dataset"; // "bucket" or "dataset"
+        const repoId = env.HF_REPO_ID; 
+        const repoType = env.HF_REPO_TYPE || "dataset"; 
 
         if (!hfToken || !repoId) {
-          throw new Error("Missing server configuration: Ensure HF_TOKEN and HF_REPO_ID variables are set in the Cloudflare dashboard.");
+          throw new Error("Missing server configuration: HF_TOKEN and HF_REPO_ID variables are required.");
         }
 
         const hfUploadUrl = `https://huggingface.co{repoType}s/${repoId}/upload/${finalFileName}`;
 
-        // Upload the image payload to the Hugging Face Hub
         const hfResponse = await fetch(hfUploadUrl, {
           method: "POST",
           headers: {
@@ -132,10 +196,7 @@ export default {
             }
           ]
         }), { 
-          headers: { 
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*" 
-          } 
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } 
         });
 
       } catch (error) {
@@ -143,14 +204,11 @@ export default {
           content: [{ type: "text", text: `❌ Storage Error: ${error.message}` }],
           isError: true
         }), { 
-          headers: { 
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*" 
-          } 
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } 
         });
       }
     }
 
-    return new Response("Hugging Face MCP Server running on Cloudflare Workers", { status: 200 });
+    return new Response("Secure Hugging Face MCP Server running.", { status: 200 });
   }
 };
